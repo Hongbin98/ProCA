@@ -43,7 +43,7 @@ Final accuracies (%) on the **Office-Home-CI** dataset (ResNet-50).
 ![experiments_OH](./results/exper_oh.png)
 
 Final accuracies (%) on the **Office-31-CI** and **ImageNet-Caltech** dataset (ResNet-50).
-![experiments_OH](./results/exper_31_ic.png)
+![experiments_OH](./results/exper_31_IC.png)
 
 # Citation
 If you find our work useful in your research, please cite the following paper:
