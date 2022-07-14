@@ -1,0 +1,8 @@
+numpy==1.19.2
+Pillow==9.2.0
+scikit_learn==1.1.1
+scipy==1.5.2
+tensorboardX==2.5.1
+torch==1.1.0
+torchvision==0.3.0
+tqdm==4.63.0
