@@ -9,13 +9,13 @@ import torch.optim as optim
 from torchvision import transforms
 from torch.utils.data import DataLoader
 import random, pdb, math, copy
-from tqdm import tqdm
+# from tqdm import tqdm
 from scipy.spatial.distance import cdist
-from OH_datasets import FileListDataset, Imagenet_Dataset
+from OH_datasets import FileListDataset
 from OH_datasets import my_Dataset as Dataset
 import torch.nn.functional as F
 from losses import infoNCE
-from test import val_pclass
+from test import val_pclass_OH as val_pclass
 from tensorboardX import SummaryWriter
 from PIL import Image
 from test import val_office, centers_val_office
@@ -28,8 +28,10 @@ def arg_parser():
     parser.add_argument('--gpu', default='6', help='gpu device_ids for cuda')
     parser.add_argument('--batchsize', default=32, type=int)
     parser.add_argument('--lr', default=0.001, type=float)
-    parser.add_argument('--max_epoch', default=15, type=int)
-    parser.add_argument('--source_model', default='./model_source/20220715-0848-single_gpu_cal256_ce_resnet50_best.pkl')
+    parser.add_argument('--max_epoch', default=30, type=int)
+    parser.add_argument('--source_model', default='./model_source/20220715-1518-OH_Art_ce_singe_gpu_resnet50_best.pkl')
+    parser.add_argument('--source', default=0, type=int)
+    parser.add_argument('--target', default=1, type=int)
 
     args = parser.parse_args()
     return args
@@ -75,6 +77,13 @@ class reply_dataset(torch.utils.data.Dataset):
 
     def __len__(self):
         return self.labels.shape[0]
+
+
+def cosine_similarity(feature, pairs):
+    feature = F.normalize(feature)
+    pairs = F.normalize(pairs)
+    similarity = feature.mm(pairs.t())
+    return similarity
 
 
 def obtain_label(loader, net, confi_class_idx):
@@ -137,21 +146,55 @@ def obtain_label(loader, net, confi_class_idx):
         prediction_c1 = confi_class_idx[pred_label]
         acc = np.sum(prediction_c1 == all_label.float().numpy()) / len(all_fea)
 
-    log_str = 'Accuracy = {:.3f}% -> {:.3f}%'.format(accuracy, acc)
+    log_str = 'Accuracy = {:.2f}% -> {:.2f}%'.format(accuracy * 100, acc * 100)
     print(log_str + '\n')
     return dict(zip(all_idx.int().numpy(), prediction_c1)), accuracy * 100, acc * 100
 
 
-def cosine_similarity(feature, pairs):
-    feature = F.normalize(feature)
-    pairs = F.normalize(pairs)
-    similarity = feature.mm(pairs.t())
-    return similarity
+def get_target_centers(target_train_loader, net, confi_class_idx, confi_label_dict):
+    net.eval()
+    start_test = True
+    with torch.no_grad():
+        iter_test = iter(target_train_loader)
+        for _ in range(len(target_train_loader)):
+            data = iter_test.next()
+            inputs = data[0]
+            sample_idx = data[2]
+            inputs = inputs.cuda()
+            _, feas = net(inputs)
+            if start_test:
+                all_fea = feas.float().cpu()
+                all_idx = sample_idx.float().cpu()
+                start_test = False
+            else:
+                all_idx = torch.cat((all_idx, sample_idx.float()), 0)
+                all_fea = torch.cat((all_fea, feas.float().cpu()), 0)
+
+    # for each class
+    for idx, cls in enumerate(confi_class_idx):
+        cnt = 0
+        for i, sam_idx in enumerate(all_idx):
+            if confi_label_dict[sam_idx.item()] == cls:
+                if cnt == 0:
+                    target_cls_proto = all_fea[i]
+                else:
+                    target_cls_proto += all_fea[i]
+
+                cnt += 1
+
+        target_cls_proto = target_cls_proto / cnt
+
+        if idx == 0:
+            total_target_protos = target_cls_proto.unsqueeze(0)
+        else:
+            total_target_protos = torch.cat((total_target_protos, target_cls_proto.unsqueeze(0)), 0)
+
+    return total_target_protos
 
 
 def get_confi_classes(source_model, target_data_loader, threshold=0.2):
     source_model.eval()
-    prediction_bank = torch.zeros(1, 256).cuda()
+    prediction_bank = torch.zeros(1, 65).cuda()
     for j, (img_data, _, _) in enumerate(target_data_loader):
         img_data = img_data.cuda()
         with torch.no_grad():
@@ -171,66 +214,61 @@ def get_confi_classes(source_model, target_data_loader, threshold=0.2):
     for idx, value in enumerate(prediction_bank):
         prediction_bank[idx] = (prediction_bank[idx] - min_cls) / (max_cls - min_cls)
 
+    avg_prob = torch.mean(prediction_bank)
     confuse_cls_idx = []
 
     for idx, value in enumerate(prediction_bank):
         if value >= threshold:
             confi_class_idx.append(idx)
 
+        elif threshold > value > avg_prob:
+            confuse_cls_idx.append(idx)
+
     return confi_class_idx, confuse_cls_idx, prediction_bank[confi_class_idx]
-
-
-def val_net(net, test_loader):
-    net.eval()
-
-    correct = 0
-    total = 0
-
-    gt_list = []
-    p_list = []
-
-    for i, (inputs, labels) in enumerate(test_loader):
-        inputs = inputs.cuda()
-        labels = labels.cuda()
-        gt_list.append(labels.cpu().numpy())
-        with torch.no_grad():
-            outputs, _ = net(inputs)
-        output_prob = F.softmax(outputs, dim=1).data
-        p_list.append(output_prob[:, 1].detach().cpu().numpy())
-        _, predicted = torch.max(outputs, 1)
-        total += inputs.size(0)
-        num = (predicted == labels).sum()
-        correct = correct + num
-
-    acc = 100. * correct.item() / total
-
-    return acc
 
 
 def get_source_centers(source_loader, net):
     net.eval()
-
-    fea_list = []
-    label_list = []
+    start_test = True
     with torch.no_grad():
         iter_test = iter(source_loader)
-        for _ in tqdm(range(len(source_loader))):
+        for _ in range(len(source_loader)):
             data = iter_test.next()
             inputs = data[0]
             labels = data[1]
             inputs = inputs.cuda()
             outputs, feas = net(inputs)
+            if start_test:
+                all_fea = feas.float().cpu()
+                all_output = outputs.float().cpu()
+                all_label = labels.float()
+                start_test = False
+            else:
+                all_fea = torch.cat((all_fea, feas.float().cpu()), 0)
+                all_output = torch.cat((all_output, outputs.float().cpu()), 0)
+                all_label = torch.cat((all_label, labels.float()), 0)
+    all_output = nn.Softmax(dim=1)(all_output)
+    _, predict = torch.max(all_output, 1)
+    accuracy = torch.sum(torch.squeeze(predict).float() == all_label).item() / float(all_label.size()[0])
+    all_fea = all_fea.float().cpu()
 
-            fea_list.append(feas.float().cpu())
-            label_list.append(labels)
+    # for each class
+    for i in range(all_output.size(1)):
+        cnt = 0
+        for idx, label in enumerate(all_label):
+            if label == i:
+                if cnt == 0:
+                    source_cls_proto = all_fea[idx]
+                else:
+                    source_cls_proto += all_fea[idx]
 
-    K = outputs.size(1)
-    all_label = torch.cat(label_list, 0)
-    all_fea = torch.cat(fea_list, 0)
+                cnt += 1
 
-    total_source_protos = torch.empty(K, all_fea.size(1), dtype=all_fea.dtype)
-    for i in range(K):
-        total_source_protos[i] = all_fea[all_label == i].mean(dim=0)
+        source_cls_proto = source_cls_proto / cnt
+        if i == 0:
+            total_source_protos = source_cls_proto.unsqueeze(0)
+        else:
+            total_source_protos = torch.cat((total_source_protos, source_cls_proto.unsqueeze(0)), 0)
 
     return total_source_protos.cuda()
 
@@ -245,6 +283,7 @@ def get_one_classes_imgs(target_train_loader, class_idx, confi_label_dict):
             inputs = data[0]
             labels = data[1]
             sample_idx = data[2]
+
             if start_test:
                 all_inputs = inputs.float().cpu()
                 all_idx = sample_idx.float().cpu()
@@ -311,59 +350,6 @@ def get_buffer_centers(reply_loader, net, confi_class_total_idx):
     return total_target_protos
 
 
-def get_target_centers(target_train_loader, net, confi_class_idx, confi_label_dict):
-    net.eval()
-    start_test = True
-    with torch.no_grad():
-        iter_test = iter(target_train_loader)
-        for _ in range(len(target_train_loader)):
-            data = iter_test.next()
-            inputs = data[0]
-            sample_idx = data[2]
-            inputs = inputs.cuda()
-            _, feas = net(inputs)
-            if start_test:
-                all_fea = feas.float().cpu()
-                all_idx = sample_idx.float().cpu()
-                start_test = False
-            else:
-                all_idx = torch.cat((all_idx, sample_idx.float()), 0)
-                all_fea = torch.cat((all_fea, feas.float().cpu()), 0)
-
-    # for each class
-    for idx, cls in enumerate(confi_class_idx):
-        cnt = 0
-        for i, sam_idx in enumerate(all_idx):
-            if confi_label_dict[sam_idx.item()] == cls:
-                if cnt == 0:
-                    target_cls_proto = all_fea[i]
-                else:
-                    target_cls_proto += all_fea[i]
-
-                cnt += 1
-
-        target_cls_proto = target_cls_proto / cnt
-
-        if idx == 0:
-            total_target_protos = target_cls_proto.unsqueeze(0)
-        else:
-            total_target_protos = torch.cat((total_target_protos, target_cls_proto.unsqueeze(0)), 0)
-
-    return total_target_protos
-
-
-#######################################################################################
-#######################################################################################
-#######################################################################################
-#######################################################################################
-"""
-So the reply buffer should 3 functions
-1. store the reply buffers(original data) and their soft-predictions to prevent catastrophic forgetting
-2. combine the target data with the reply buffers, and calculate the features to align both domains
-3. calculate the prototype(mean features) of each class to do classification
-"""
-
-
 class reply_buffer():
     def __init__(self, transform, imgs_per_class=20):
         super(reply_buffer, self).__init__()
@@ -404,7 +390,9 @@ class reply_buffer():
         now_class_mean = np.zeros((1, 2048))  # for ResNet-50
 
         for i in range(self.m):
+            # shape：batch_size*512
             x = class_mean - (now_class_mean + feature_extractor_output) / (i + 1)
+            # shape：batch_size
             x = np.linalg.norm(x, axis=1)
             index = np.argmin(x)
             now_class_mean += feature_extractor_output[index]
@@ -425,7 +413,9 @@ class reply_buffer():
         now_class_mean = np.zeros((1, 2048))  # for ResNet-50
 
         for i in range(self.m):
+            # shape：batch_size*512
             x = class_mean - (now_class_mean + feature_extractor_output) / (i + 1)
+            # shape：batch_size
             x = np.linalg.norm(x, axis=1)
             index = np.argmin(x)
             now_class_mean += feature_extractor_output[index]
@@ -440,7 +430,6 @@ class reply_buffer():
 if __name__ == '__main__':
     args = arg_parser()
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
-    torch.multiprocessing.set_sharing_strategy('file_system')
     writer = SummaryWriter()
 
     last_acc_stages = []
@@ -448,38 +437,35 @@ if __name__ == '__main__':
     center_acc_stages = []
     top_ten_stages = []
 
-    total_cls_nums = 256
+    # training in the clipart domain
+    source = args.source
+    target = args.target
+    total_cls_nums = 65
     incre_cls_nums = 10
     reply_buffer_nums = 10
     batch_size = args.batchsize
-    pseudo_update_interval = 10
-    prototypes_update_interval = 10
-    source_centers_update_interval = 10
-
+    pseudo_update_interval = 15
+    prototypes_update_interval = 15
     diff_of_centers = torch.zeros((total_cls_nums, 2048))
-
     # optimizer
-    lr = args.lr
+    lr = 1e-3
     weight_decay = 1e-6
     momentum = 0.9
-    n_epoches = args.max_epoch
+    n_epoches = 30
 
     # dataset
-    cal_dataset = Dataset(
-        path='../../dataset/ImageNet-Caltech',
-        domains=['256_ObjectCategories'],
+    my_dataset = Dataset(
+        path='../../dataset/office-home',
+        domains=['Art', 'Clipart', 'Product', 'Real_World'],
         files=[
-            'caltech_list.txt',
+            'Art.txt',
+            'Clipart.txt',
+            'Product.txt',
+            'Real_World.txt'
         ],
-        prefix='../../dataset/ImageNet-Caltech')
-
-    imgNet_dataset = Imagenet_Dataset(
-        path='../../dataset/ImageNet-Caltech',
-        domains=['imageNet_84_val'],
-        files=[
-            'imagenet_84_list.txt',
-        ],
-        prefix='../../dataset/ImageNet-Caltech')
+        prefix='../../dataset/office-home')
+    source_file = my_dataset.files[source]
+    target_file = my_dataset.files[target]
 
     transform_test = transforms.Compose([
         transforms.Resize((224, 224)),
@@ -500,81 +486,62 @@ if __name__ == '__main__':
     confi_cls_value = np.zeros(total_cls_nums)
     reply_buffer = reply_buffer(transform_test, reply_buffer_nums)
 
-    source = 0
-    target = 0
-
-    source_file = cal_dataset.files[0]
-    target_file = imgNet_dataset.files[0]
-
     # pre-trained model
     pretrained_net = torch.load(args.source_model)
     pretrained_net = pretrained_net.cuda()
     pretrained_net.eval()
 
-    cal_84_cls_list = [188, 0, 165, 145, 33, 94, 76, 86, 71, 128, 225, 108, 219, 115, 87, 44, 62, 163, 85, 177, 134,
-                       229, 82, 60, 29, 172, 114, 160, 146, 228, 245, 75, 157, 209, 97, 106, 170, 198, 92, 230, 234, 40,
-                       200, 151, 11, 27, 185, 47, 45, 9, 88, 37, 30, 2, 90, 196, 181, 28, 253, 112, 178, 109, 39, 96,
-                       192, 110, 211, 237, 249, 89, 215, 116, 126, 133, 107, 123, 193, 68, 179, 227, 150, 141, 7, 50]
-    cal_84_cls_list.sort()
+    for incre_idx in range(total_cls_nums // 10):
+        target_total_classes = [i for i in range(total_cls_nums)]
 
-    top_ten_cls_idx = cal_84_cls_list[:10]
-    for incre_idx in range(len(cal_84_cls_list) // incre_cls_nums):  # only for the first stage
-        source_total_classes = [i for i in range(total_cls_nums)]
-        target_train_classes = [cal_84_cls_list[i] for i in
-                                range(incre_cls_nums * incre_idx, incre_cls_nums * incre_idx + incre_cls_nums)]
-        target_test_classes = [cal_84_cls_list[i] for i in range(0, incre_cls_nums * incre_idx + incre_cls_nums)]
+        target_train_classes = [i for i in range(10 * incre_idx, 10 * incre_idx + 10)]
+        target_test_classes = [i for i in range(0, 10 * incre_idx + 10)]
 
-        source_total_ds = FileListDataset(list_path=source_file, path_prefix=cal_dataset.prefixes[source],
+        source_total_ds = FileListDataset(list_path=source_file, path_prefix=my_dataset.prefixes[source],
                                           transform=transform_test,
-                                          filter=(lambda x: x in source_total_classes), return_id=False)
-        source_total_loader = torch.utils.data.DataLoader(source_total_ds, batch_size=batch_size,
-                                                          shuffle=True,
+                                          filter=(lambda x: x in target_total_classes), return_id=False)
+        source_total_loader = torch.utils.data.DataLoader(source_total_ds, batch_size=batch_size, shuffle=True,
                                                           num_workers=2 * 4)
 
-        target_train_ds = FileListDataset(list_path=target_file, path_prefix=imgNet_dataset.prefixes[target],
+        target_train_ds = FileListDataset(list_path=target_file, path_prefix=my_dataset.prefixes[target],
                                           return_id=True,
-                                          transform=transform_test,
-                                          filter=(lambda x: x in target_train_classes))
-
+                                          transform=transform_test, filter=(lambda x: x in target_train_classes))
         target_train_dl = DataLoader(dataset=target_train_ds, batch_size=batch_size, shuffle=True,
                                      num_workers=2 * 4)
 
-        target_test_ds = FileListDataset(list_path=target_file, path_prefix=imgNet_dataset.prefixes[target],
-                                         transform=transform_test,
-                                         filter=(lambda x: x in target_test_classes),
+        target_test_ds = FileListDataset(list_path=target_file, path_prefix=my_dataset.prefixes[target],
+                                         transform=transform_test, filter=(lambda x: x in target_test_classes),
                                          return_id=False)
-        target_test_loader = torch.utils.data.DataLoader(target_test_ds, batch_size=batch_size,
-                                                         shuffle=False,
+        target_test_loader = torch.utils.data.DataLoader(target_test_ds, batch_size=batch_size, shuffle=False,
                                                          num_workers=2 * 4)
 
-        confi_class_idx, confuse_cls_idx, confi_class_values = get_confi_classes(pretrained_net,
-                                                                                 target_train_dl,
+        confi_class_idx, confuse_cls_idx, confi_class_values = get_confi_classes(pretrained_net, target_train_dl,
                                                                                  threshold=0.15)
-        print(target_train_classes)
         print(confi_class_idx)
-        print('From {} to {}, the source-only accuracy is:'.format(cal_dataset.domains[source],
-                                                                   imgNet_dataset.domains[target]))
+        print(confi_class_values)
         pred_label_dict, _, _ = obtain_label(target_train_dl, pretrained_net, confi_class_idx)
 
         if incre_idx == 0:
-            net = torch.load(args.source_model)
-            net = net.cuda()
+            net = resnet50(pretrained=True)
+            net.fc = nn.Linear(2048, total_cls_nums)
+            net = nn.DataParallel(net).cuda()
         else:
-            net = torch.load('./model_source/C2I_{}_2_{}_Resnet50_DA_last_stage{}.pt'.format(source, target, incre_idx - 1))
+            net = torch.load('./model_source/{}_2_{}_Resnet50_DA_last_stage{}.pt'.format(source, target, incre_idx - 1))
 
         # optimizer
         param_group = []
         for p in net.parameters():
             p.requires_grad = True
-        for k, v in net.named_parameters():
+        for k, v in net.module.named_parameters():
             if k[:2] == 'fc':
                 param_group += [{'params': v, 'lr': lr}]
             else:
                 param_group += [{'params': v, 'lr': lr}]
         optimizer = optim.SGD(param_group, momentum=momentum, weight_decay=weight_decay)
-        best_tar_acc = 0.
-        this_stage_save_imgs = True
 
+        best_tar_acc = 0.
+
+        this_stage_save_imgs = True
         for epoch in range(n_epoches):
 
             iter_target_train = iter(target_train_dl)
@@ -585,13 +552,15 @@ if __name__ == '__main__':
             if reply_buffer.exemplar_set:  # if there are any prototype-images
                 # get the reply buffer loader
                 reply_ds = reply_dataset(images=reply_buffer.exemplar_set, labels=confi_cls_history,
-                                         buffer_per_class=reply_buffer_nums,
-                                         soft_predictions=reply_buffer.soft_pred)
+                                         buffer_per_class=reply_buffer_nums, soft_predictions=reply_buffer.soft_pred)
                 reply_loader = torch.utils.data.DataLoader(reply_ds, batch_size=batch_size, shuffle=True)
                 iter_reply_buffer = iter(reply_loader)
 
             if epoch % pseudo_update_interval == 0 and epoch != 0:
                 pred_label_dict, _, _ = obtain_label(target_train_dl, pretrained_net, confi_class_idx)
+
+            # get source centers
+            source_centers = get_source_centers(source_total_loader, pretrained_net)
 
             sum_contras = torch.tensor(0.).cuda()
             for iter_idx in range(min_iterations):
@@ -633,6 +602,7 @@ if __name__ == '__main__':
                 tar_contras_loss = torch.tensor(0.).cuda()
                 distill_loss = torch.tensor(0.).cuda()
                 if reply_buffer.exemplar_set:  # if there are any prototype-images
+                    # since the memory limitation is about 100 samples, we repeat 100/batch size times to calculate all samples
                     data_buffer = next(iter_reply_buffer, -1)
                     if data_buffer == -1:
                         data_target_iter = iter(reply_loader)
@@ -671,7 +641,8 @@ if __name__ == '__main__':
                 # source_ce and loss_ce are CE part
                 # tar_contras_loss are contrastive part
                 # loss1 is the distillation part
-                total_loss = (source_ce + loss_ce) + 0.1 * tar_contras_loss + 1.0 * distill_loss
+                total_loss = (source_ce + loss_ce) + 0.1 * tar_contras_loss + 1 * distill_loss
+
                 total_loss.backward()
                 optimizer.step()
 
@@ -689,22 +660,16 @@ if __name__ == '__main__':
                             reply_buffer.construct_exemplar_set(imgs, net)
                     else:
                         history_idx = confi_cls_history.index(confi_class)
-                        if confi_class_values[confi_idx] >= confi_cls_value[confi_class]:
+                        if confi_class_values[confi_idx] >= confi_cls_value[confi_class]:  # 大于或者等于都更新
                             imgs = get_one_classes_imgs(target_train_dl, confi_class, pred_label_dict)
                             reply_buffer.update_exemplar_set(imgs, net, history_idx)
-
                 this_stage_save_imgs = False
-
-                print('Source-centers update')
-                source_centers = get_source_centers(source_total_loader, pretrained_net)
-                print('Finish!')
-
-            acc_list = val_pclass(net, target_test_loader, total_cls_nums, total_cls_nums, target_test_classes)
+            acc_list = val_pclass(net, target_test_loader, total_cls_nums, total_cls_nums)
             if incre_idx < total_cls_nums // incre_cls_nums:
                 acc_list = acc_list[:(incre_idx + 1) * incre_cls_nums]
 
             if incre_cls_nums >= 10:
-                top_ten_classes_mean = acc_list[:10]
+                top_ten_classes_mean = acc_list[:10] * 100
 
             avg_contras = sum_contras / min_iterations
             print('Epoch: %d, source ce_loss is %.3f, target pseudo_label ce loss is %.3f' % (
@@ -713,6 +678,9 @@ if __name__ == '__main__':
                 epoch, avg_contras.item()))
             print('Epoch: %d, distillation loss is %.3f' % (
                 epoch, distill_loss.item()))
+
+            print('acc list is {}'.format(np.round(acc_list, 3)))
+            print('mean acc is %.3f' % acc_list.mean())
             print('top ten classes mean acc is %.3f' % top_ten_classes_mean.mean())
 
             # save the tensorboard logs
@@ -737,42 +705,21 @@ if __name__ == '__main__':
                 best_tar_acc = total_mean_acc
                 # torch.save(net, './model_source/{}_2_{}_Resnet50_DA_Best_stage{}.pt'.format(source, target, incre_idx))
 
-            torch.save(net, './model_source/C2I_{}_2_{}_Resnet50_DA_last_stage{}.pt'.format(source, target, incre_idx))
+            torch.save(net, './model_source/{}_2_{}_Resnet50_DA_last_stage{}.pt'.format(source, target, incre_idx))
+
         best_acc_stages.append(best_tar_acc)
-        ################################################################################################
-        # centers classification
-        # after training, get the target centers
-        stage_target_protos = get_buffer_centers(reply_loader, net, confi_class_idx)
-        stage_tar_centers = get_target_centers(target_train_dl, net, confi_class_idx, pred_label_dict)
-
-        center_diff = stage_tar_centers - stage_target_protos
-        for i, cls in enumerate(confi_class_idx):
-            diff_of_centers[cls] = center_diff[i]
-
-        final_protos = get_buffer_centers(reply_loader, net, confi_cls_history)
-        for i, cls in enumerate(confi_cls_history):
-            final_protos[i] += diff_of_centers[cls]
-        center_acc = centers_val_office(net, target_test_loader, final_protos, confi_cls_history)
-        print('Proto-centers acc is: %.3f' % center_acc)
-        center_acc_stages.append(center_acc)
-        ################################################################################################
         # last acc & top ten classes acc
         last_total_mean_acc = val_office(net, target_test_loader)
-        last_acc_stages.append(last_total_mean_acc / 100)
+        last_acc_stages.append(last_total_mean_acc)
         top_ten_stages.append(top_ten_classes_mean.mean())
-
-    print('From {} to {}, the best accuracy of different stages is:'.format(imgNet_dataset.domains[source],
-                                                                            cal_dataset.domains[target]))
+    print('From {} to {}, the best accuracy of different stages is:'.format(my_dataset.domains[source],
+                                                                            my_dataset.domains[target]))
     print(np.round(best_acc_stages, 3))
 
-    print('From {} to {}, the last accuracy of different stages is:'.format(imgNet_dataset.domains[source],
-                                                                            cal_dataset.domains[target]))
+    print('From {} to {}, the last accuracy of different stages is:'.format(my_dataset.domains[source],
+                                                                            my_dataset.domains[target]))
     print(np.round(last_acc_stages, 3))
 
-    print('From {} to {}, the top_ten accuracy of different stages is:'.format(imgNet_dataset.domains[source],
-                                                                               cal_dataset.domains[target]))
+    print('From {} to {}, the top_ten accuracy of different stages is:'.format(my_dataset.domains[source],
+                                                                               my_dataset.domains[target]))
     print(np.round(top_ten_stages, 3))
-
-    print('From {} to {}, the center accuracy of different stages is:'.format(imgNet_dataset.domains[source],
-                                                                              cal_dataset.domains[target]))
-    print(np.round(center_acc_stages, 3))

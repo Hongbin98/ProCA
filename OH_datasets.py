@@ -13,11 +13,14 @@ class my_Dataset:
         self.prefixes = [self.prefix] * len(self.domains)
 
 class Imagenet_Dataset:
-    def __init__(self, path, domains, files, prefix):
+    def __init__(self, path, domains, files, prefix, is_join=True):
         self.path = path
         self.prefix = prefix
         self.domains = domains
-        self.files = [(os.path.join(path, file)) for file in files]
+        if not is_join:
+            self.files = [file for file in files]
+        else:
+            self.files = [(os.path.join(path, file)) for file in files]
         self.prefixes = [self.prefix] * len(self.domains)
 
 
