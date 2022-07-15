@@ -30,7 +30,7 @@ pip install -r requirements.txt
 
 from Art to Clipart on Office-Home-CI:
 ```
-python OH_source_Train.py --gpu 0 --source
+python OH_source_Train.py --gpu 0 --source 0
 ```
 
 from Caltech256 to ImageNet84:
