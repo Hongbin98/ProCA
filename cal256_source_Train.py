@@ -19,9 +19,9 @@ def arg_parser():
     parser.add_argument('--gpu', default='7', help='gpu device_ids for cuda')
     parser.add_argument('--batchsize', default=64, type=int)
     parser.add_argument('--lr', default=0.001, type=float)
-    parser.add_argument('--MultiStepLR', default=[10, 20, 30, 40], nargs='+', type=int,
+    parser.add_argument('--MultiStepLR', default=[3, 6, 9], nargs='+', type=int,
                         help='reduce LR by 0.1 when the current epoch is in this list')
-    parser.add_argument('--max_epoch', default=50, type=int)
+    parser.add_argument('--max_epoch', default=10, type=int)
 
     args = parser.parse_args()
     return args
