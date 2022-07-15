@@ -26,13 +26,27 @@ pip install -r requirements.txt
 
 - Put the corresponding `.txt` file in your path (e.g., '../../dataset/ImageNet-Caltech/caltech_list.txt').
 ## Source Pre-trained
-- First, to obtain the pre-trained model (e.g., from Caltech256 to ImageNet84) on the source domain: 
+- First, to obtain the pre-trained model on the source domain: 
+
+from Art to Clipart on Office-Home-CI:
+```
+python OH_source_Train.py --gpu 0 --source
+```
+
+from Caltech256 to ImageNet84:
 ```
 python cal256_source_Train.py --gpu 0
 ```
 
-## Adapt to the Target domain 
-- Second, to train ProCA on the target domain (please assign a source-trained model path, also from Caltech256 to ImageNet84):
+## Adapt to the Target Domain 
+- Second, to train ProCA on the target domain (please assign a source-trained model path):
+
+from Art to Clipart on Office-Home-CI:
+```
+python OH_adapt_2_target.py --gpu 0 --source 0 --target 1 --source_model ./model_source/20220715-1518-OH_Art_ce_singe_gpu_resnet50_best.pkl
+```
+
+from Caltech256 to ImageNet84:
 ```
 python IC_from_c_2_i.py --gpu 0 --source_model ./model_source/20220714-1949-single_gpu_cal256_ce_resnet50_best.pkl
 ```
