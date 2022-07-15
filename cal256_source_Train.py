@@ -123,7 +123,7 @@ class Trainer(object):
             os.mkdir(source_model_root)
 
         net = resnet50(pretrained=True)
-        net.fc = weightNorm(nn.Linear(2048, cls_nums), name="weight")
+        net.fc = nn.Linear(2048, cls_nums)
         net = net.cuda()
 
         param_group = []
@@ -162,7 +162,7 @@ class Trainer(object):
         val_loader = torch.utils.data.DataLoader(source_train_ds, batch_size=batch_size, shuffle=False,
                                                  num_workers=2 * n_gpus if n_gpus <= 2 else 2)
 
-        loss = CrossEntropyLabelSmooth(num_classes=cls_nums).cuda()
+        loss = nn.CrossEntropyLoss()
 
         for i in range(epochs):
             running_loss = []
